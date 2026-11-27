@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 from time import perf_counter
@@ -154,7 +155,9 @@ def smt(w: Workflow, timeout: Optional[float] = None) -> Iterator[tuple[int, ...
             return
         if state != z3.sat:
             reason = solver.reason_unknown()
-            if deadline is not None and "timeout" in reason.lower():
+            if deadline is not None and (
+                "timeout" in reason.lower() or "canceled" in reason.lower()
+            ):
                 raise TimeoutError("SMT solver timed out")
             raise RuntimeError(reason)
 
@@ -166,9 +169,14 @@ def smt(w: Workflow, timeout: Optional[float] = None) -> Iterator[tuple[int, ...
         solver.add(z3.Or([v != u for v, u in zip(x, plan)]))
 
 
+def default_cp_sat_workers(steps: int) -> int:
+    """Use 1 worker for small/medium workflows and up to 8 workers for n > 20."""
+    return 1 if steps <= 20 else min(8, os.cpu_count() or 1)
+
+
 def cp_sat(
     w: Workflow,
-    workers: int = 1,
+    workers: Optional[int] = None,
     timeout: Optional[float] = None,
 ) -> Iterator[tuple[int, ...]]:
     """Solve WSP via OR-Tools CP-SAT Boolean matrix (Formulas B1-B7)."""
@@ -226,17 +234,20 @@ def cp_sat(
         add_cons(sum(used) <= k)
 
     # B6: One-team constraint with dead-team pre-filtering.
-    for steps, teams in w.teams:
+    for idx, (steps, teams) in enumerate(w.teams):
         valid_teams = [t for t in teams if all(t & w.domains[s] for s in steps)]
         if not valid_teams:
             return
-        selected = [new_bool("team") for _ in valid_teams]
+        selected = [new_bool(f"team_{idx}_{h}") for h in range(len(valid_teams))]
         add_exact_one(selected)
         for team, flag in zip(valid_teams, selected):
             for s in steps:
                 add_cons(sum(rows[s][u] for u in sorted(team & w.domains[s])) >= flag)
 
-    solver.parameters.num_search_workers = workers
+    num_workers = default_cp_sat_workers(w.steps) if workers is None else workers
+    if num_workers < 1:
+        raise ValueError("workers must be >= 1")
+    solver.parameters.num_search_workers = num_workers
 
     while True:
         if deadline is not None:
@@ -456,9 +467,10 @@ METHODS = {"smt": smt, "cp-sat": cp_sat, "pattern": patterns}
 def Solver(filename: str | Path, **kwargs) -> dict[str, object]:
     """Solve a WSP instance file and return the coursework template dictionary.
 
-    Defaults to ``method="cp-sat"`` for reliable termination across large and
-    unseen instances. Optional keyword arguments: ``method``, ``timeout``
-    (seconds), and ``workers`` (for ``cp-sat``).
+    Defaults to ``method="cp-sat"`` with adaptive search workers (``1`` when
+    ``n <= 20`` to avoid thread-pool overhead, scaling up to
+    ``min(8, os.cpu_count() or 1)`` when ``n > 20``). Optional keyword arguments:
+    ``method``, ``timeout`` (seconds), and ``workers`` (int override for ``cp-sat``).
     """
     start = perf_counter()
     w = read_workflow(filename)
@@ -466,19 +478,29 @@ def Solver(filename: str | Path, **kwargs) -> dict[str, object]:
     timeout = kwargs.get("timeout")
 
     if method == "cp-sat":
-        plans = cp_sat(w, workers=kwargs.get("workers", 1), timeout=timeout)
+        plans = cp_sat(w, workers=kwargs.get("workers"), timeout=timeout)
     elif method in METHODS:
         plans = METHODS[method](w, timeout=timeout)
     else:
         raise ValueError(f"Unknown solver method: {method}")
 
     first = next(plans, None)
-    second = next(plans, None) if first is not None else None
-    for plan in (first, second):
-        if plan is not None and not valid(w, plan):
+    if first is not None and not valid(w, first):
+        raise ValueError("Solver produced an invalid assignment")
+
+    second: Optional[tuple[int, ...]] = None
+    second_timed_out = False
+    if first is not None:
+        try:
+            second = next(plans, None)
+        except TimeoutError:
+            second_timed_out = True
+
+    if second is not None:
+        if not valid(w, second):
             raise ValueError("Solver produced an invalid assignment")
-    if second is not None and first == second:
-        raise ValueError("Duplicate assignment")
+        if first == second:
+            raise ValueError("Duplicate assignment")
 
     return dict(
         sat="unsat" if first is None else "sat",
@@ -487,9 +509,13 @@ def Solver(filename: str | Path, **kwargs) -> dict[str, object]:
             ""
             if first is None
             else (
-                "this is the only solution"
-                if second is None
-                else "other solutions exist"
+                "unknown (timeout)"
+                if second_timed_out
+                else (
+                    "this is the only solution"
+                    if second is None
+                    else "other solutions exist"
+                )
             )
         ),
         exe_time=f"{1000 * (perf_counter() - start):.3f}ms",
@@ -514,8 +540,8 @@ if __name__ == "__main__":
     cli.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="Search workers for cp-sat (default: 1)",
+        default=None,
+        help="Search workers for cp-sat (default: adaptive, 1 if n <= 20 else min(8, cpu_count))",
     )
     args = cli.parse_args()
     print(
